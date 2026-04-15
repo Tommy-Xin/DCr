@@ -206,15 +206,25 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     def save_resume_checkpoint(unwrapped_super_model, optimizer, lr_scheduler, global_step, epoch):
+        original_model = (
+            unwrapped_super_model._orig_mod
+            if is_compiled_module(unwrapped_super_model)
+            else unwrapped_super_model
+        )
         save_path_resume = os.path.join(args.output_dir, f"checkpoint-resume-{global_step}.pt")
         resume_state = {
-            "global_step": global_step,
-            "epoch": epoch,
-            "super_model": deepcopy(unwrapped_super_model).state_dict(),
-            "optimizer": optimizer.state_dict(),
+            "model": deepcopy(original_model).state_dict(),
+            "opt": optimizer.state_dict(),
             "lr_scheduler": lr_scheduler.state_dict(),
+            "args": OmegaConf.to_container(args, resolve=True),
+            "steps": global_step,
+            "epoch": epoch,
         }
-        torch.save(resume_state, save_path_resume)
+        tmp_path = os.path.join(
+            args.output_dir, f".checkpoint-resume-{global_step}.pt.{os.getpid()}.tmp"
+        )
+        torch.save(resume_state, tmp_path)
+        os.replace(tmp_path, save_path_resume)
         return save_path_resume
 
     if args.resume_from_checkpoint:
@@ -246,10 +256,18 @@ def main():
             if path.endswith(".pt"):
                 checkpoint = torch.load(resume_path, map_location="cpu")
                 unwrapped_super_model = accelerator.unwrap_model(super_model)
-                unwrapped_super_model.load_state_dict(checkpoint["super_model"], strict=True)
-                optimizer.load_state_dict(checkpoint["optimizer"])
+                original_model = (
+                    unwrapped_super_model._orig_mod
+                    if is_compiled_module(unwrapped_super_model)
+                    else unwrapped_super_model
+                )
+                if "model" in checkpoint:
+                    original_model.load_state_dict(checkpoint["model"], strict=True)
+                else:
+                    original_model.load_state_dict(checkpoint["super_model"], strict=True)
+                optimizer.load_state_dict(checkpoint.get("opt", checkpoint["optimizer"]))
                 lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-                global_step = int(checkpoint["global_step"])
+                global_step = int(checkpoint.get("steps", checkpoint["global_step"]))
                 first_epoch = int(checkpoint.get("epoch", global_step // num_update_steps_per_epoch))
             else:
                 accelerator.load_state(resume_path)
