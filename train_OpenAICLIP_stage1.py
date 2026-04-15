@@ -205,15 +205,34 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    def save_resume_checkpoint(unwrapped_super_model, optimizer, lr_scheduler, global_step, epoch):
+        save_path_resume = os.path.join(args.output_dir, f"checkpoint-resume-{global_step}.pt")
+        resume_state = {
+            "global_step": global_step,
+            "epoch": epoch,
+            "super_model": deepcopy(unwrapped_super_model).state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "lr_scheduler": lr_scheduler.state_dict(),
+        }
+        torch.save(resume_state, save_path_resume)
+        return save_path_resume
+
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
             path = os.path.basename(args.resume_from_checkpoint)
         else:
-            # Get the most recent checkpoint
-            dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
+            # Get the most recent checkpoint dir or resume .pt
+            entries = os.listdir(args.output_dir)
+            dirs = [d for d in entries if d.startswith("checkpoint-") and os.path.isdir(os.path.join(args.output_dir, d))]
+            pt_files = [d for d in entries if d.startswith("checkpoint-resume-") and d.endswith(".pt")]
+
+            def _extract_step(name):
+                match = re.search(r"(\d+)", name)
+                return int(match.group(1)) if match else -1
+
+            candidates = dirs + pt_files
+            candidates = sorted(candidates, key=lambda x: _extract_step(x))
+            path = candidates[-1] if len(candidates) > 0 else None
 
         if path is None:
             accelerator.print(
@@ -223,11 +242,21 @@ def main():
             initial_global_step = 0
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
-            global_step = int(path.split("-")[1])
+            resume_path = os.path.join(args.output_dir, path)
+            if path.endswith(".pt"):
+                checkpoint = torch.load(resume_path, map_location="cpu")
+                unwrapped_super_model = accelerator.unwrap_model(super_model)
+                unwrapped_super_model.load_state_dict(checkpoint["super_model"], strict=True)
+                optimizer.load_state_dict(checkpoint["optimizer"])
+                lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+                global_step = int(checkpoint["global_step"])
+                first_epoch = int(checkpoint.get("epoch", global_step // num_update_steps_per_epoch))
+            else:
+                accelerator.load_state(resume_path)
+                global_step = int(path.split("-")[1])
+                first_epoch = global_step // num_update_steps_per_epoch
 
             initial_global_step = global_step
-            first_epoch = global_step // num_update_steps_per_epoch
 
     else:
         initial_global_step = 0
@@ -316,8 +345,18 @@ def main():
                         # save optimizer state
                         save_path_optimizer = os.path.join(args.output_dir, f"optimizer-state-{global_step}.bin")
                         torch.save(optimizer.state_dict(), save_path_optimizer)
+                        # save resumable checkpoint
+                        save_path_resume = save_resume_checkpoint(
+                            unwrapped_super_model=unwrapped_super_model,
+                            optimizer=optimizer,
+                            lr_scheduler=lr_scheduler,
+                            global_step=global_step,
+                            epoch=epoch,
+                        )
 
-                        logger.info(f"Saved ckpts to {save_path_dit} and {save_path_project_clip}")
+                        logger.info(
+                            f"Saved ckpts to {save_path_dit}, {save_path_project_clip}, and resumable {save_path_resume}"
+                        )
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -331,6 +370,14 @@ def main():
                     # save project clip ckpts
                     save_path_project_clip = os.path.join(args.output_dir, f"checkpoint-project-clip-{global_step}.bin")
                     torch.save(deepcopy(unwrapped_super_model.clip_vis.project_clip).state_dict(), save_path_project_clip)
+                    # save final resumable checkpoint
+                    save_resume_checkpoint(
+                        unwrapped_super_model=unwrapped_super_model,
+                        optimizer=optimizer,
+                        lr_scheduler=lr_scheduler,
+                        global_step=global_step,
+                        epoch=epoch,
+                    )
 
                 break
 
