@@ -35,7 +35,6 @@ from diffusers.training_utils import EMAModel, compute_dream_and_update_latents,
 from diffusers.utils import check_min_version, deprecate, is_wandb_available, make_image_grid
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
-from diffusers.utils.torch_utils import is_compiled_module
 from einops import rearrange
 
 from image_datasets.dataset_cc3m import loader
@@ -206,32 +205,26 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     def save_resume_checkpoint(unwrapped_super_model, optimizer, lr_scheduler, global_step, epoch):
-        original_model = (
-            unwrapped_super_model._orig_mod
-            if is_compiled_module(unwrapped_super_model)
-            else unwrapped_super_model
-        )
         save_path_resume = os.path.join(args.output_dir, f"checkpoint-resume-{global_step}.pt")
+        tmp_save_path_resume = f"{save_path_resume}.tmp"
         resume_state = {
-            "model": deepcopy(original_model).state_dict(),
-            "opt": optimizer.state_dict(),
-            "lr_scheduler": lr_scheduler.state_dict(),
-            "args": OmegaConf.to_container(args, resolve=True),
-            "steps": global_step,
+            "global_step": global_step,
             "epoch": epoch,
+            "super_model": deepcopy(unwrapped_super_model).state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "lr_scheduler": lr_scheduler.state_dict(),
         }
-        tmp_path = os.path.join(
-            args.output_dir, f".checkpoint-resume-{global_step}.pt.{os.getpid()}.tmp"
-        )
-        torch.save(resume_state, tmp_path)
-        os.replace(tmp_path, save_path_resume)
+        # Write to a temp file first, then atomically replace the target checkpoint.
+        # This avoids exposing partially written checkpoint files.
+        torch.save(resume_state, tmp_save_path_resume)
+        os.replace(tmp_save_path_resume, save_path_resume)
         return save_path_resume
 
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
+            candidates = [os.path.basename(args.resume_from_checkpoint)]
         else:
-            # Get the most recent checkpoint dir or resume .pt
+            # Get candidate checkpoint dirs and resume files.
             entries = os.listdir(args.output_dir)
             dirs = [d for d in entries if d.startswith("checkpoint-") and os.path.isdir(os.path.join(args.output_dir, d))]
             pt_files = [d for d in entries if d.startswith("checkpoint-resume-") and d.endswith(".pt")]
@@ -240,41 +233,49 @@ def main():
                 match = re.search(r"(\d+)", name)
                 return int(match.group(1)) if match else -1
 
-            candidates = dirs + pt_files
-            candidates = sorted(candidates, key=lambda x: _extract_step(x))
-            path = candidates[-1] if len(candidates) > 0 else None
+            # Try from newest to oldest, so we can fall back when the latest is corrupted.
+            candidates = sorted(dirs + pt_files, key=lambda x: _extract_step(x), reverse=True)
 
-        if path is None:
+        if len(candidates) == 0:
             accelerator.print(
                 f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
             )
             args.resume_from_checkpoint = None
             initial_global_step = 0
         else:
-            accelerator.print(f"Resuming from checkpoint {path}")
-            resume_path = os.path.join(args.output_dir, path)
-            if path.endswith(".pt"):
-                checkpoint = torch.load(resume_path, map_location="cpu")
-                unwrapped_super_model = accelerator.unwrap_model(super_model)
-                original_model = (
-                    unwrapped_super_model._orig_mod
-                    if is_compiled_module(unwrapped_super_model)
-                    else unwrapped_super_model
-                )
-                if "model" in checkpoint:
-                    original_model.load_state_dict(checkpoint["model"], strict=True)
-                else:
-                    original_model.load_state_dict(checkpoint["super_model"], strict=True)
-                optimizer.load_state_dict(checkpoint.get("opt", checkpoint["optimizer"]))
-                lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-                global_step = int(checkpoint.get("steps", checkpoint["global_step"]))
-                first_epoch = int(checkpoint.get("epoch", global_step // num_update_steps_per_epoch))
-            else:
-                accelerator.load_state(resume_path)
-                global_step = int(path.split("-")[1])
-                first_epoch = global_step // num_update_steps_per_epoch
+            last_error = None
+            resumed = False
+            for path in candidates:
+                resume_path = os.path.join(args.output_dir, path)
+                accelerator.print(f"Trying to resume from checkpoint {path}")
+                try:
+                    if path.endswith(".pt"):
+                        checkpoint = torch.load(resume_path, map_location="cpu")
+                        unwrapped_super_model = accelerator.unwrap_model(super_model)
+                        unwrapped_super_model.load_state_dict(checkpoint["super_model"], strict=True)
+                        optimizer.load_state_dict(checkpoint["optimizer"])
+                        lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+                        global_step = int(checkpoint["global_step"])
+                        first_epoch = int(checkpoint.get("epoch", global_step // num_update_steps_per_epoch))
+                    else:
+                        accelerator.load_state(resume_path)
+                        global_step = int(path.split("-")[1])
+                        first_epoch = global_step // num_update_steps_per_epoch
+                    resumed = True
+                    accelerator.print(f"Resumed from checkpoint {path}")
+                    break
+                except Exception as err:
+                    last_error = err
+                    logger.warning(f"Failed loading checkpoint {resume_path}: {repr(err)}")
 
-            initial_global_step = global_step
+            if resumed:
+                initial_global_step = global_step
+            else:
+                accelerator.print(
+                    f"All candidate checkpoints failed to load. Starting a new training run. Last error: {repr(last_error)}"
+                )
+                args.resume_from_checkpoint = None
+                initial_global_step = 0
 
     else:
         initial_global_step = 0
