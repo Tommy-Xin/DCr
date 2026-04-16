@@ -1,4 +1,5 @@
 import argparse
+from datetime import timedelta
 import logging
 import math
 import os
@@ -13,7 +14,7 @@ import torch.nn.functional as F
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration
+from accelerate.utils import InitProcessGroupKwargs, ProjectConfiguration
 from diffusers import DDPMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.utils import is_wandb_available
@@ -108,11 +109,13 @@ def main():
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
+    ddp_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=180000000))
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
+        kwargs_handlers=[ddp_kwargs],
     )
 
     logging.basicConfig(
@@ -355,7 +358,9 @@ def main():
                 )
                 loss = loss.mean()
 
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                # Use scalar reduction instead of gather on repeated tensors to avoid
+                # cross-rank shape mismatches when per-rank batch sizes diverge.
+                avg_loss = accelerator.reduce(loss.detach(), reduction="mean")
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 accelerator.backward(loss)
