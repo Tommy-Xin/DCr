@@ -100,7 +100,7 @@ def compute_dpo_loss(anchor_vec, pos_plus_vec, gt_vec, all_vec, tau=0.1, dpo_bet
 
     preference = (pos_log_sum - neg_log_sum) / denom
     loss = -F.logsigmoid(dpo_beta * preference)
-    return loss
+    return loss, pos_log_sum, neg_log_sum, denom, preference
 
 
 def main():
@@ -345,14 +345,15 @@ def main():
                 all_vec = F.normalize(model_pred.reshape(bs, bs, -1), dim=2)
 
                 # DPO objective with separately aggregated negative samples.
-                loss = compute_dpo_loss(
+                loss, pos_log_sum, neg_log_sum, denom, preference = compute_dpo_loss(
                     anchor_vec=anchor_vec,
                     pos_plus_vec=pos_plus_vec,
                     gt_vec=gt_vec,
                     all_vec=all_vec,
                     tau=tau,
                     dpo_beta=dpo_beta,
-                ).mean()
+                )
+                loss = loss.mean()
 
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
@@ -391,7 +392,7 @@ def main():
                         f"Saved ckpts to {save_path_dit}, {save_path_project_clip}, and resumable {save_path_resume}"
                     )
 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": loss.detach().item(), "pos_log_sum": pos_log_sum.detach().mean().item(), "neg_log_sum": neg_log_sum.detach().mean().item(), "denom": denom.detach().mean().item(), "preference": preference.detach().mean().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
