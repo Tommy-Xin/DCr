@@ -1,6 +1,6 @@
 model_name: "dcr"
 data_config:
-  train_batch_size: 8
+  train_batch_size: 16
   num_workers: 4
   img_size: 224
   img_dir: /c20250502/lyh/xinc/PhyGen/datasets/cc3m/
@@ -32,5 +32,5 @@ checkpointing_steps: 20000
 checkpoints_total_limit: 5
 tracker_project_name: sd-2.1
 resume_from_checkpoint: latest
-gradient_accumulation_steps: 2
+gradient_accumulation_steps: 4
 rank: 1

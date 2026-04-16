@@ -32,7 +32,7 @@ checkpointing_steps: 20000
 checkpoints_total_limit: 5
 tracker_project_name: sd-2.1
 resume_from_checkpoint: latest
-gradient_accumulation_steps: 1
+gradient_accumulation_steps: 4
 rank: 1
 dpo_beta: 1.0
 tau: 0.1
